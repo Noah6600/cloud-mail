@@ -1,7 +1,7 @@
 import BizError from "../error/biz-error";
 import orm from "../entity/orm";
 import {oauth} from "../entity/oauth";
-import { eq } from 'drizzle-orm';
+import {eq} from 'drizzle-orm';
 import userService from "./user-service";
 import loginService from "./login-service";
 import cryptoUtils from "../utils/crypto-utils";
@@ -10,7 +10,7 @@ const oauthService = {
 
 	async bindUser(c, params) {
 
-		const { email, oauthUserId, code } = params;
+		const {email, oauthUserId, code} = params;
 
 		const oauthRow = await this.getById(c, oauthUserId);
 
@@ -20,19 +20,19 @@ const oauthService = {
 			throw new BizError('用户已绑定有邮箱')
 		}
 
-		await loginService.register(c, { email, password: cryptoUtils.genRandomPwd(), code }, true);
+		await loginService.register(c, {email, password: cryptoUtils.genRandomPwd(), code}, true);
 
 		userRow = await userService.selectByEmail(c, email);
 
-		orm(c).update(oauth).set({ userId: userRow.userId }).where(eq(oauth.oauthUserId, oauthUserId)).run();
-		const jwtToken = await loginService.login(c, { email, password: null }, true);
+		orm(c).update(oauth).set({userId: userRow.userId}).where(eq(oauth.oauthUserId, oauthUserId)).run();
+		const jwtToken = await loginService.login(c, {email, password: null}, true);
 
-		return { userInfo: oauthRow, token: jwtToken}
+		return {userInfo: oauthRow, token: jwtToken}
 	},
 
 	async linuxDoLogin(c, params) {
 
-		const { code } = params;
+		const {code} = params;
 
 		let token = '';
 		let userInfo = {}
@@ -46,7 +46,7 @@ const oauthService = {
 
 		const tokenRes = await fetch("https://connect.linux.do/oauth2/token", {
 			method: "POST",
-			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			headers: {"Content-Type": "application/x-www-form-urlencoded"},
 			body: reqParams.toString()
 		})
 
@@ -67,6 +67,27 @@ const oauthService = {
 		}
 
 		userInfo = await userRes.json();
+		// 从环境变量获取 二次认证url,调用二次认证接口 ,post传递 {oauthUserInfo:userInfo,client_id,redirect_uri} 返回 {success:boolean,msg:string}
+		const cfCheckLoginUrl = c.env.cf_check_login_url;
+		if (cfCheckLoginUrl){
+			const checkRes = await fetch(cfCheckLoginUrl, {
+				method: "POST",
+				headers: {"Content-Type": "application/json"},
+				body: JSON.stringify({
+					oauthUserInfo: userInfo,
+					client_id: c.env.linuxdo_client_id,
+					redirect_uri: c.env.linuxdo_callback_url
+				})
+			})
+
+			if (!checkRes.ok) {
+				throw new BizError(checkRes.statusText)
+			}
+			let checkResData = await checkRes.json();
+			if (!checkResData.success) {
+				throw new BizError(checkResData.msg)
+			}
+		}
 
 		userInfo.oauthUserId = String(userInfo.id);
 		userInfo.active = userInfo.active ? 0 : 1;
@@ -74,15 +95,16 @@ const oauthService = {
 		userInfo.trustLevel = userInfo.trust_level;
 		userInfo.avatar = userInfo.avatar_url;
 
-		const  oauthRow = await this.saveUser(c, userInfo);
+
+		const oauthRow = await this.saveUser(c, userInfo);
 		const userRow = await userService.selectByIdIncludeDel(c, oauthRow.userId);
 
 		if (!userRow) {
-			return { userInfo: oauthRow, token: null }
+			return {userInfo: oauthRow, token: null}
 		}
 
-		const JwtToken = await loginService.login(c, { email: userRow.email, password: null }, true);
-		return { userInfo: oauthRow, token: JwtToken }
+		const JwtToken = await loginService.login(c, {email: userRow.email, password: null}, true);
+		return {userInfo: oauthRow, token: JwtToken}
 	},
 
 	async saveUser(c, userInfo) {
@@ -112,4 +134,4 @@ const oauthService = {
 
 }
 
-export default  oauthService
+export default oauthService
