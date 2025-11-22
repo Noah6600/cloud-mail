@@ -14,6 +14,7 @@ import { isDel, roleConst } from '../const/entity-const';
 import email from '../entity/email';
 import userService from './user-service';
 import KvConst from '../const/kv-const';
+import oauthService from './oauth-service';
 
 const publicService = {
 
@@ -165,7 +166,7 @@ const publicService = {
 
 		if (list.length === 0) return;
 
-		// 验证邮箱并生成密码
+		// 验证邮箱并生成密码，同时检查 OAuth 用户状态
 		for (const emailRow of list) {
 			if (!verifyUtils.isEmail(emailRow.email)) {
 				throw new BizError(t('notEmail'));
@@ -178,6 +179,18 @@ const publicService = {
 			// 验证 oauthUserId 必填
 			if (!emailRow.oauthUserId) {
 				throw new BizError('OAuth用户ID(oauthUserId)不能为空');
+			}
+
+			// 检查 oauthUserId 是否已存在
+			const existingOauth = await oauthService.getById(c, emailRow.oauthUserId);
+			if (existingOauth) {
+				if (existingOauth.userId && existingOauth.userId !== 0) {
+					throw new BizError(`OAuth用户ID(${emailRow.oauthUserId})已绑定其他邮箱，无法创建`);
+				}
+				// userId == 0，标记为需要更新而非插入
+				emailRow._oauthExists = true;
+			} else {
+				emailRow._oauthExists = false;
 			}
 
 			const { salt, hash } = await saltHashUtils.hashPassword(
@@ -198,7 +211,7 @@ const publicService = {
 		const sqlList = [];
 
 		for (const emailRow of list) {
-			let { email, hash, salt, roleName, oauthUserId, username, name, avatar, trustLevel } = emailRow;
+			let { email, hash, salt, roleName, oauthUserId, username, name, avatar, trustLevel, _oauthExists } = emailRow;
 			let type = defRole.roleId;
 
 			if (roleName) {
@@ -218,23 +231,26 @@ const publicService = {
 			const userSql = `INSERT INTO user (email, password, salt, type, os, browser, active_ip, create_ip, device, active_time, create_time)
 			VALUES ('${escapedEmail}', '${hash}', '${salt}', ${type}, '${os}', '${browser}', '${activeIp}', '${activeIp}', '${device}', '${activeTime}', '${activeTime}')`;
 
-			// 2. 插入 account 表,暂时 user_id = 0
+			// 2. 插入 account 表，暂时 user_id = 0
 			const accountSql = `INSERT INTO account (email, name, user_id)
 			VALUES ('${escapedEmail}', '${escapedAccountName}', 0);`;
 
-			// 3. 插入 oauth 表,暂时 user_id = 0
-			const oauthSql = `INSERT INTO oauth (oauth_user_id, username, name, avatar, active, trust_level, silenced, user_id)
-			VALUES ('${escapedOauthUserId}', '${escapedUsername}', '${escapedName}', '${escapedAvatar}', 0, ${trustLevel || 0}, 0, 0);`;
-
 			sqlList.push(c.env.db.prepare(userSql));
 			sqlList.push(c.env.db.prepare(accountSql));
-			sqlList.push(c.env.db.prepare(oauthSql));
+
+			// 3. 根据 OAuth 记录是否存在决定插入或跳过
+			if (!_oauthExists) {
+				// OAuth 记录不存在，插入新记录
+				const oauthSql = `INSERT INTO oauth (oauth_user_id, username, name, avatar, active, trust_level, silenced, user_id)
+				VALUES ('${escapedOauthUserId}', '${escapedUsername}', '${escapedName}', '${escapedAvatar}', 0, ${trustLevel || 0}, 0, 0);`;
+				sqlList.push(c.env.db.prepare(oauthSql));
+			}
 		}
 
 		// 4. 批量更新 account 表的 user_id
 		sqlList.push(c.env.db.prepare(`UPDATE account SET user_id = (SELECT user_id FROM user WHERE user.email = account.email) WHERE user_id = 0;`));
 
-		// 5. 批量更新 oauth 表的 user_id (通过 oauthUserId 精确关联)
+		// 5. 批量更新 oauth 表的 user_id（包括新创建的和已存在的）
 		for (const emailRow of list) {
 			const escapedEmail = emailRow.email.replace(/'/g, "''");
 			const escapedOauthUserId = emailRow.oauthUserId.replace(/'/g, "''");
