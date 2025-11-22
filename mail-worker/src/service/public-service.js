@@ -160,6 +160,101 @@ const publicService = {
 
 	},
 
+	async addOauthUser(c, params) {
+		const { list } = params;
+
+		if (list.length === 0) return;
+
+		// 验证邮箱并生成密码
+		for (const emailRow of list) {
+			if (!verifyUtils.isEmail(emailRow.email)) {
+				throw new BizError(t('notEmail'));
+			}
+
+			if (!c.env.domain.includes(emailUtils.getDomain(emailRow.email))) {
+				throw new BizError(t('notEmailDomain'));
+			}
+
+			// 验证 oauthUserId 必填
+			if (!emailRow.oauthUserId) {
+				throw new BizError('OAuth用户ID(oauthUserId)不能为空');
+			}
+
+			const { salt, hash } = await saltHashUtils.hashPassword(
+				emailRow.password || cryptoUtils.genRandomPwd()
+			);
+
+			emailRow.salt = salt;
+			emailRow.hash = hash;
+		}
+
+		const activeIp = reqUtils.getIp(c);
+		const { os, browser, device } = reqUtils.getUserAgent(c);
+		const activeTime = dayjs().format('YYYY-MM-DD HH:mm:ss');
+
+		const roleList = await roleService.roleSelectUse(c);
+		const defRole = roleList.find(roleRow => roleRow.isDefault === roleConst.isDefault.OPEN);
+
+		const sqlList = [];
+
+		for (const emailRow of list) {
+			let { email, hash, salt, roleName, oauthUserId, username, name, avatar, trustLevel } = emailRow;
+			let type = defRole.roleId;
+
+			if (roleName) {
+				const roleRow = roleList.find(role => role.name === roleName);
+				type = roleRow ? roleRow.roleId : type;
+			}
+
+			// 转义单引号防止 SQL 注入
+			const escapedEmail = email.replace(/'/g, "''");
+			const escapedUsername = (username || '').replace(/'/g, "''");
+			const escapedName = (name || '').replace(/'/g, "''");
+			const escapedAvatar = (avatar || '').replace(/'/g, "''");
+			const escapedOauthUserId = oauthUserId.replace(/'/g, "''");
+			const escapedAccountName = emailUtils.getName(email).replace(/'/g, "''");
+
+			// 1. 插入 user 表
+			const userSql = `INSERT INTO user (email, password, salt, type, os, browser, active_ip, create_ip, device, active_time, create_time)
+			VALUES ('${escapedEmail}', '${hash}', '${salt}', ${type}, '${os}', '${browser}', '${activeIp}', '${activeIp}', '${device}', '${activeTime}', '${activeTime}')`;
+
+			// 2. 插入 account 表,暂时 user_id = 0
+			const accountSql = `INSERT INTO account (email, name, user_id)
+			VALUES ('${escapedEmail}', '${escapedAccountName}', 0);`;
+
+			// 3. 插入 oauth 表,暂时 user_id = 0
+			const oauthSql = `INSERT INTO oauth (oauth_user_id, username, name, avatar, active, trust_level, silenced, user_id)
+			VALUES ('${escapedOauthUserId}', '${escapedUsername}', '${escapedName}', '${escapedAvatar}', 0, ${trustLevel || 0}, 0, 0);`;
+
+			sqlList.push(c.env.db.prepare(userSql));
+			sqlList.push(c.env.db.prepare(accountSql));
+			sqlList.push(c.env.db.prepare(oauthSql));
+		}
+
+		// 4. 批量更新 account 表的 user_id
+		sqlList.push(c.env.db.prepare(`UPDATE account SET user_id = (SELECT user_id FROM user WHERE user.email = account.email) WHERE user_id = 0;`));
+
+		// 5. 批量更新 oauth 表的 user_id (通过 oauthUserId 精确关联)
+		for (const emailRow of list) {
+			const escapedEmail = emailRow.email.replace(/'/g, "''");
+			const escapedOauthUserId = emailRow.oauthUserId.replace(/'/g, "''");
+
+			sqlList.push(c.env.db.prepare(
+				`UPDATE oauth SET user_id = (SELECT user_id FROM user WHERE email = '${escapedEmail}') WHERE oauth_user_id = '${escapedOauthUserId}' AND user_id = 0;`
+			));
+		}
+
+		try {
+			await c.env.db.batch(sqlList);
+		} catch (e) {
+			if(e.message.includes('SQLITE_CONSTRAINT')) {
+				throw new BizError(t('emailExistDatabase'))
+			} else {
+				throw e
+			}
+		}
+	},
+
 	async genToken(c, params) {
 
 		await this.verifyUser(c, params)
